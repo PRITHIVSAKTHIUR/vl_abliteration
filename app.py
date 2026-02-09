@@ -321,4 +321,4 @@ with gr.Blocks(title="Qwen-VL Abliterator") as demo:
     )
 
 if __name__ == "__main__":
-    demo.queue().launch()
+    demo.queue().launch(share=True, debug=True)
