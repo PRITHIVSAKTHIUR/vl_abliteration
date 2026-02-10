@@ -5,4 +5,7 @@ einops
 torch
 bitsandbytes
 accelerate
-huggingface-hub
+huggingface_hub
+gradio
+hf_xet
+matplotlib
