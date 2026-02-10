@@ -68,7 +68,6 @@ def get_model_layers(model):
     # 4. Deep search for ModuleList
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.ModuleList) and len(module) > 0:
-            # Check if it looks like a transformer block (has attention or mlp)
             if hasattr(module[0], "self_attn") or hasattr(module[0], "mlp") or hasattr(module[0], "attn"):
                 return module
                 
@@ -95,31 +94,22 @@ def get_refusal_direction(model, processor, device, layer_idx, num_instructions)
         hidden_states_list = []
         
         for inst in tqdm(instructions, desc="Generating Hidden States"):
-            # Text-Only Chat Template
             messages = [
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": inst}
             ]
-            
-            # Apply template
             text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            
-            # Tokenize
-            inputs = processor(text=[text], return_tensors="pt", padding=True)
-            inputs = inputs.to(device)
+            inputs = processor(text=[text], return_tensors="pt", padding=True).to(device)
             
             with torch.inference_mode():
                 outputs = model(**inputs, output_hidden_states=True)
             
-            # Extract hidden states
-            # outputs.hidden_states is a tuple. Index 0 = embeddings.
-            # We want the output of layer_idx, which is typically at index (layer_idx + 1)
+            # Extract hidden states (usually layer_idx + 1 due to embeddings)
             if hasattr(outputs, "hidden_states"):
                 hs = outputs.hidden_states[layer_idx + 1]
             else:
                 hs = outputs['hidden_states'][layer_idx + 1]
                 
-            # Get the last token's hidden state: [batch, seq_len, hidden_dim] -> [hidden_dim]
             last_token_hs = hs[:, -1, :] 
             hidden_states_list.append(last_token_hs.cpu())
             
@@ -142,141 +132,80 @@ def get_refusal_direction(model, processor, device, layer_idx, num_instructions)
 def apply_abliteration(model, refusal_dir, device):
     """
     Robustly iterates through model layers and orthogonalizes weights.
-    Auto-detects output projections based on shape and typical naming conventions.
+    Uses weight SHAPE detection to find target matrices regardless of naming.
     """
     layers = get_model_layers(model)
     
-    # Move refusal vector to correct device and dtype
     refusal_dir = refusal_dir.to(device)
     refusal_dir = refusal_dir.to(dtype=model.dtype) 
     
-    # The size of the refusal vector corresponds to the hidden_size of the model
+    # hidden_size is the length of the refusal vector
     hidden_size = refusal_dir.shape[-1]
     
     count = 0
-    modified_modules = []
+    modified_types = []
 
-    print(f"Scanning for matrices with output dimension: {hidden_size}...")
+    print(f"Scanning for Linear layers with Output Dimension: {hidden_size}...")
 
-    for i, layer in enumerate(tqdm(layers, desc="Scanning & Ablating Layers")):
-        # Iterate over all sub-modules in this layer
+    # Names to strictly avoid (Input projections)
+    # We only want to abliterate layers that WRITE to the residual stream (Output/Down projections)
+    avoid_substrings = ["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "w1", "w3"]
+
+    for i, layer in enumerate(tqdm(layers, desc="Scanning Layers")):
+        # Recursive search for all modules in this layer
         for name, module in layer.named_modules():
             
-            # We are looking for Linear layers (or quantized Linear layers)
-            # Standard Linear or bitsandbytes Linear
-            if "Linear" in module.__class__.__name__:
+            # Check if it has a weight attribute (covers Linear, Linear4bit, etc.)
+            if hasattr(module, "weight"):
+                w = module.weight
                 
-                # Check 1: Output Dimension Match
-                # PyTorch Linear weights are [out_features, in_features]
-                # Quantized weights might be different, but usually have 'out_features' attribute
-                
-                out_dim = getattr(module, "out_features", None)
-                if out_dim is None and hasattr(module, "weight"):
-                     out_dim = module.weight.shape[0]
-
-                if out_dim == hidden_size:
-                    # Check 2: Filter Logic
-                    # We want layers that WRITE to the residual stream (Output Proj, Down Proj).
-                    # We do NOT want layers that READ from it (Q, K, V, Up, Gate).
+                # Check dimensions
+                # PyTorch Linear weights: [out_features, in_features]
+                # We want out_features == hidden_size
+                if w.shape[0] == hidden_size:
                     
-                    # Common target names
-                    target_hints = ["down_proj", "o_proj", "output", "c_proj", "linear2", "dense_4h_to_h"]
-                    # Common avoidance names
-                    avoid_hints = ["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "w1", "w3"]
-
-                    is_target = False
-                    
-                    # If name explicitly matches a target hint
-                    if any(h in name for h in target_hints):
-                        is_target = True
-                    # If name explicitly matches an avoid hint, skip
-                    elif any(h in name for h in avoid_hints):
-                        is_target = False
-                    else:
-                        # Ambiguous case: If it outputs to hidden size and isn't a known input projection, assume yes
-                        # (This handles 'dense' in some older architectures)
-                        is_target = True
-
-                    if is_target:
-                        # Proceed with Orthogonalization
-                        try:
-                            w = module.weight.data
+                    # Double check it's not a prohibited layer type (like Query/Key/Value)
+                    if any(bad in name for bad in avoid_substrings):
+                        continue
+                        
+                    # If we passed checks, this is likely an output projection (down_proj or o_proj)
+                    try:
+                        # Normalize Refusal Vector
+                        v = refusal_dir.view(-1)
+                        v_norm = v / (v.norm() + 1e-8)
+                        
+                        # --- Orthogonalization Math ---
+                        # We want to remove v from the output space (columns of W^T, or rows of W).
+                        # Matrix Correction = OuterProduct(v, v @ W)
+                        # v [d] . W [d, k] -> overlap [k]
+                        # v [d] * overlap [k] -> correction [d, k]
+                        
+                        # Note on shapes:
+                        # v_norm is [hidden_size]
+                        # w.data is [hidden_size, in_features]
+                        
+                        # Calculate overlap of vector with every column of weight matrix?
+                        # No, we assume W maps TO hidden_size.
+                        # We project the rows of W onto the null space of v.
+                        
+                        overlap = torch.matmul(v_norm, w.data) # Result: [in_features]
+                        correction = torch.outer(v_norm, overlap) # Result: [hidden_size, in_features]
+                        
+                        # Apply subtraction
+                        module.weight.data -= correction
+                        count += 1
+                        
+                        short_name = name.split(".")[-1]
+                        if short_name not in modified_types:
+                            modified_types.append(short_name)
                             
-                            # Normalize Refusal Vector
-                            v = refusal_dir.view(-1)
-                            v_norm = v / (v.norm() + 1e-8)
-                            
-                            # Calculate Projection: (w . v) * v^T
-                            # We want to remove the component of v from the ROWS of W (output space) ??
-                            # Wait, Linear(x) = xA^T. 
-                            # If we want the output y to not contain v.
-                            # y = x W^T. 
-                            # We project the columns of W^T (rows of W) onto the null space of v.
-                            # So we remove v from every row of W.
-                            
-                            # Projection of row r onto v: (r . v) * v
-                            # Matrix operation: (W * v) * v^T (outer product)
-                            
-                            # W shape: [out, in]
-                            # v shape: [out] (hidden size)
-                            # This math only works if we are modifying the INPUT side of the weight?
-                            # NO.
-                            
-                            # Let's look at the standard implementations (Refusal in Residual Stream).
-                            # The "Refusal Direction" is a vector in the residual stream.
-                            # The matrices `down_proj` and `o_proj` WRITE to the residual stream.
-                            # Their output dimension is `hidden_size`.
-                            # We want their output to NOT contain the refusal direction.
-                            # So we must modify the columns of W^T (the rows of W).
-                            
-                            # Calculation:
-                            # overlaps = W @ v_norm  (Shape: [out, in] @ [out] ? Error. Dimensions mismatch)
-                            # W is [out, in]. v is [out].
-                            # We need to project every column of W (size out) onto v.
-                            # Wait. W maps from `intermediate` to `hidden`.
-                            # W shape: [hidden, intermediate].
-                            # v shape: [hidden].
-                            
-                            # Yes. We treat columns of W as vectors in the hidden space.
-                            # We remove the component v from each column.
-                            
-                            # Projection of column c onto v: (c . v) * v
-                            # Matrix: P = v * v^T. 
-                            # W_new = P_orth * W = (I - v*v^T) * W 
-                            # W_new = W - v * (v^T * W)
-                            
-                            # v [d, 1]. W [d, k].
-                            # v^T * W -> [1, d] * [d, k] -> [1, k] (scalar overlap for each column)
-                            # v * (v^T W) -> [d, 1] * [1, k] -> [d, k] correction matrix.
-                            
-                            # Implementation:
-                            overlap = torch.matmul(v_norm, w) # [d_in] ? No.
-                            # torch.matmul(v, w) tries to dot product if 1D. 
-                            # v is [d_out]. W is [d_out, d_in].
-                            # PyTorch matmul broadcast rules: 
-                            # If first arg is 1D, it prepends a 1. [1, d_out] @ [d_out, d_in] -> [1, d_in].
-                            # Perfect.
-                            
-                            overlap = torch.matmul(v_norm, w) # Shape [d_in]
-                            
-                            # Outer product to get correction matrix
-                            # correction = v_norm.unsqueeze(1) @ overlap.unsqueeze(0)
-                            correction = torch.outer(v_norm, overlap) # [d_out, d_in]
-                            
-                            # Apply
-                            module.weight.data -= correction
-                            count += 1
-                            if name not in modified_modules:
-                                modified_modules.append(name)
-                                
-                        except Exception as e:
-                            print(f"Skipping module {name} due to math error: {e}")
+                    except Exception as e:
+                        print(f"⚠️ Failed to modify {name}: {e}")
 
     if count == 0:
-        return "❌ Error: Found 0 matrices to modify. Please check if model loaded correctly."
+        return f"❌ Error: Found 0 matrices with output size {hidden_size}. Model structure mismatch."
         
-    unique_mods = list(set([n.split('.')[-1] for n in modified_modules]))
-    return f"✅ Success: Applied orthogonalization to {count} matrices. (Types: {unique_mods})"
+    return f"✅ Success: Modified {count} matrices. (Found types: {modified_types})"
 
 # -----------------------------------------------------------------------------
 # Main Processing Generator
@@ -376,6 +305,7 @@ def process_model(model_id, hf_token, repo_id, layer_percentage, max_shard_size,
         yield log("✂️ Applying Abliteration...")
         msg = apply_abliteration(model, refusal_dir, device)
         yield log(msg)
+        if "❌" in msg: return # Stop if abliteration failed
     except Exception as e:
         yield log(f"❌ Error applying abliteration: {e}")
         return
