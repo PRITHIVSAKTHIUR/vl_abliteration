@@ -5,13 +5,13 @@ import random
 import gc
 from tqdm import tqdm
 from transformers import (
-    Qwen2_5_VLForConditionalGeneration, # Try standard first
+    Qwen2_5_VLForConditionalGeneration,
     AutoModelForCausalLM,
     AutoProcessor,
     BitsAndBytesConfig,
     AutoConfig
 )
-# Attempt to import Qwen3 if available, otherwise fallback
+
 try:
     from transformers import Qwen3VLForConditionalGeneration
 except ImportError:
