@@ -1,4 +1,9 @@
-vl_abliteration is a GUI-based tool designed to abliterat(e) vision-language and text-only transformer models in a controlled, research-friendly way. Built with Gradio, it lets users load Qwen-family VL models or standard causal LLMs, compute a refusal direction by contrasting harmful and harmless instructions, and then neutralize that direction by orthogonalizing key attention and MLP projection weights across selected layers. The app supports flexible layer-depth targeting, optional 4-bit loading for memory efficiency, and end-to-end workflows including local saving and direct upload to Hugging Face. With robust model and layer detection, automatic processor handling, and real-time logs, vl_abliteration makes experimenting with safety, alignment, and behavior steering in multimodal transformer models accessible through a clean, interactive interface.
+
+```
+State: Experimental
+```
+
+Abliteration pipeline for transformer-based language models, focused on identifying and neutralizing refusal-related behavior at the representation level. It loads Qwen-family or compatible causal LLMs, samples harmful and harmless instructions, and computes a refusal direction by contrasting their mean hidden states at a configurable transformer layer. The app then applies targeted orthogonalization to the model’s MLP projection weights to remove that direction, effectively steering model behavior without full retraining. Designed for reproducibility and experimentation, it supports configurable layer-depth selection, efficient inference-only execution, and clean export of both the computed refusal vector and the modified model for downstream use or sharing.
 
 ## Apply Abliteration
 
@@ -18,7 +23,3 @@ for layer in layers:
 ```
 
 References: [sumandora / remove-refusals-with-transformers](https://github.com/sumandora/remove-refusals-with-transformers), [Maxime Labonne – Uncensor Any LLM with Abliteration](https://mlabonne.github.io/blog/posts/2024-06-04_Uncensor_any_LLM_with_abliteration.html)
-
-```
-State: Experimental
-```
