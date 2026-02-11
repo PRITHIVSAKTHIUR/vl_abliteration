@@ -18,7 +18,7 @@ POS = -1
 HARMFUL_FILE = "harmful.txt"
 HARMLESS_FILE = "harmless.txt"
 
-OUTPUT_DIR = MODEL_ID.replace("/", "_") + "_abliterated"
+OUTPUT_DIR = "output-model"
 
 
 # ---------------- MODEL LOADING ----------------
@@ -93,8 +93,8 @@ def compute_refusal_direction(model, tokenizer):
     layer_idx = int(total_layers * LAYER_RATIO)
 
     print(f"Total layers: {total_layers}")
-    print(f"Using layer_ratio: {LAYER_RATIO}")
-    print(f"Computed layer_idx: {layer_idx}")
+    print(f"Layer ratio: {LAYER_RATIO}")
+    print(f"Using layer_idx: {layer_idx}")
 
     harmful_hidden = generate_hidden_states(
         model, tokenizer, harmful, layer_idx
@@ -142,12 +142,12 @@ def main():
     print("Applying abliteration")
     model = apply_abliteration(model, refusal_dir, layer_idx)
 
-    print("Saving abliterated model locally")
+    print("Saving abliterated model to output-model/")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     model.save_pretrained(OUTPUT_DIR, safe_serialization=True)
     tokenizer.save_pretrained(OUTPUT_DIR)
 
-    print(f"Abliterated model saved to {OUTPUT_DIR}")
+    print("Abliterated model saved successfully")
     print("Done")
 
 
